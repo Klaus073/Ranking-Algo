@@ -30,26 +30,13 @@ async def handle_job(job: EnqueueJob) -> None:
     if not await queue.set_debounce(job.user_id, settings.debounce_ttl_seconds):
         return
 
-    # TODO: Fetch bundle from DB (Supabase service role). For now, assume bundle is provided externally or stub.
-    # Replace the following stub with real fetching logic.
-    bundle = StudentBundle(
-        user_id=job.user_id,
-        academic_year=2,
-        university_tier="Other",
-        grade=None,
-        alevels=[],
-        num_gcse=0,
-        awards_count=0,
-        internships=[],
-        total_months_experience=0,
-        society_roles=[],
-        certifications_count=0,
-        exposure="None",
-    )
+    # Fetch bundle from DB (using service role connection)
+    await db.connect()
+    async with db.transaction() as conn:
+        bundle = await db.fetch_student_bundle(conn, job.user_id)
 
     checksum = compute_checksum(bundle)
 
-    await db.connect()
     async with db.transaction() as conn:
         # Idempotency check
         existing = await db.get_ranking_row(conn, job.user_id)
