@@ -1,6 +1,6 @@
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
-uvloop==0.19.0
+uvloop==0.19.0; sys_platform != "win32"
 httptools==0.6.1
 pydantic==1.10.15
 orjson==3.10.6
@@ -11,4 +11,5 @@ python-dotenv==1.0.1
 prometheus-client==0.20.0
 opentelemetry-sdk==1.26.0
 opentelemetry-exporter-otlp==1.26.0
+psycopg2-binary==2.9.9
 

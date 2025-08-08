@@ -14,7 +14,7 @@ FastAPI service + Redis queue + Postgres, with workers, cron, scoring functions,
 python -m venv .venv
 ./.venv/Scripts/activate  # Windows
 pip install -r requirements.txt
-uvicorn app.app:app --reload --loop uvloop --http httptools
+uvicorn app.app:app --reload --loop auto --http auto
 ```
 
 Run worker:
