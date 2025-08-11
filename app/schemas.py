@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Any
 
 from pydantic import BaseModel, Field, conint
 
@@ -29,6 +29,17 @@ class EnqueueJob(BaseModel):
     enqueued_at: datetime
     config_version: str
     attempt: int = 1
+    profile: Optional[Dict[str, Any]] = None
+
+
+class SupabaseWebhook(BaseModel):
+    event: str
+    user_id: str
+    email: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    profile: Dict[str, Any] = Field(default_factory=dict)
+    rankings: Dict[str, Any] = Field(default_factory=dict)
+    score_breakdown: Dict[str, Any] = Field(default_factory=dict)
 
 
 # Scoring inputs (bundled)
