@@ -14,19 +14,17 @@ class AppSettings(BaseModel):
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))
 
-    # Security
-    webhook_hmac_secret: str = os.getenv("WEBHOOK_HMAC_SECRET", "dev-secret")
+    # Security (unused in simplified setup)
+    webhook_hmac_secret: str = os.getenv("WEBHOOK_HMAC_SECRET", "")
     webhook_max_skew_seconds: int = int(os.getenv("WEBHOOK_MAX_SKEW_SECONDS", "300"))
 
-    # Queue / Redis
-    redis_url: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    # Queue / Redis (default to local on Windows/dev)
+    redis_url: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
     debounce_ttl_seconds: int = int(os.getenv("DEBOUNCE_TTL_SECONDS", "2"))
 
     # Database (Postgres)
-    database_url: str = os.getenv(
-        "DATABASE_URL",
-        "postgresql+asyncpg://postgres:postgres@postgres:5432/postgres",
-    )
+    # Note: asyncpg expects plain 'postgresql://' or 'postgres://'. Leave empty to disable direct DB.
+    database_url: str = os.getenv("DATABASE_URL", "")
 
     # Workers
     max_concurrency: int = int(os.getenv("MAX_CONCURRENCY", "32"))
@@ -37,6 +35,11 @@ class AppSettings(BaseModel):
 
     # Observability
     enable_metrics: bool = os.getenv("ENABLE_METRICS", "true").lower() == "true"
+
+    # Supabase client (for reads)
+    supabase_url: Optional[str] = os.getenv("SUPABASE_URL")
+    supabase_anon_key: Optional[str] = os.getenv("SUPABASE_ANON_KEY")
+    supabase_service_key: Optional[str] = os.getenv("SUPABASE_SERVICE_KEY")
 
     @property
     def webhook_skew(self) -> timedelta:
