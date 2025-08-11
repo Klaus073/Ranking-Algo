@@ -13,4 +13,20 @@ pgdata/
 node_modules/
 coverage/
 
+test.py
+trigger_webhook.py
+signup_user.py
+
+# Common local/dev artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.log
+logs/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+
 
