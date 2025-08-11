@@ -53,6 +53,9 @@ jobs:
 
             # Go to the python compose project
             cd /home/ubuntu/compose-ranking-algo
+            sudo docker compose --env-file /home/ubuntu/compose-ranking-algo/.env down
+            sudo docker compose --env-file /home/ubuntu/compose-ranking-algo/.env up -d
+
 
             # Pull the latest image from the local registry on the EC2 host
             sudo docker pull localhost:5000/${{ env.IMAGE_NAME }}:latest
