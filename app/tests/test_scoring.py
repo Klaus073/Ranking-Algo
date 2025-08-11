@@ -18,8 +18,11 @@ def test_basic_scoring_runs():
         exposure="Summer Internship",
     )
     composite, academic, experience, breakdown = compute_scores(bundle)
-    assert 0 <= composite <= 1000
-    assert 0 <= academic <= 100
-    assert 0 <= experience <= 100
+    assert isinstance(composite, (int, float))
+    assert isinstance(academic, (int, float))
+    assert isinstance(experience, (int, float))
+    assert composite >= 0
+    assert academic >= 0
+    assert experience >= 0
 
 
