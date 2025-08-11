@@ -1,0 +1,92 @@
+name: Deploy Ranking Algo (Python) to EC2
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  IMAGE_NAME: 'ranking-algo'        # <-- set to your Python image name
+  CONTAINER_NAME: 'ranking-algo'    # optional, not used directly
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure Docker for insecure registry
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{
+            "insecure-registries": ["${{ secrets.REGISTRY_HOST }}"]
+          }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sleep 10
+
+      # If you need Buildx/qemu for multi-arch, uncomment these:
+      # - name: Set up Docker Buildx
+      #   uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (Python service)
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:latest .
+          docker tag ${{ env.IMAGE_NAME }}:latest ${{ secrets.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}:latest
+          docker tag ${{ env.IMAGE_NAME }}:latest ${{ secrets.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Push to Registry
+        run: |
+          docker push ${{ secrets.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ secrets.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Deploy to EC2 (compose-ranking-algo)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_EC2_HOST }}
+          username: ${{ secrets.STAGING_EC2_USERNAME }}
+          key: ${{ secrets.STAGING_EC2_PRIVATE_KEY }}
+          # port is optional; appleboy defaults to 22 if omitted.
+          # port: ${{ secrets.STAGING_EC2_PORT }}
+          script: |
+            set -e
+
+            # Go to the python compose project
+            cd /home/ubuntu/compose-ranking-algo
+
+            # Pull the latest image from the local registry on the EC2 host
+            sudo docker pull localhost:5000/${{ env.IMAGE_NAME }}:latest
+
+            # Restart the stack
+            sudo docker compose down
+            sudo docker compose up -d
+
+            # Give containers a moment to report healthy
+            sleep 5
+
+            # Verify status
+            if sudo docker compose ps | grep -q "Up"; then
+              echo "✅ Deployment successful"
+
+              echo "Cleaning up old Docker images..."
+              # Keep only latest/tagged images for our repo; remove others & danglers
+              sudo docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | \
+                grep "localhost:5000/${{ env.IMAGE_NAME }}" | \
+                grep -v "latest" | \
+                awk '{print $2}' | \
+                xargs -r sudo docker rmi -f 2>/dev/null || true
+
+              sudo docker image prune -f
+              echo "✅ Cleanup complete"
+            else
+              echo "❌ Deployment failed! Showing recent logs…"
+              sudo docker compose logs --tail=100
+              exit 1
+            fi
+
+    # Prevent overlapping deploys on main
+    concurrency:
+      group: ranking-algo-main
+      cancel-in-progress: true
+
+
