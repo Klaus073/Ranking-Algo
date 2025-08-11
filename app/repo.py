@@ -9,6 +9,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 
 from .config import settings
+import os
+import httpx
+import logging
+
+
+logger = logging.getLogger("ranking.repo")
 from .schemas import (
     ALevel,
     Internship,
@@ -22,10 +28,13 @@ class Database:
     def __init__(self, dsn: str) -> None:
         self._dsn = dsn
         self._pool: Optional[asyncpg.Pool] = None
+        self._supabase = None
 
     async def connect(self) -> None:
-        if self._pool is None:
+        if self._dsn and self._pool is None:
             self._pool = await asyncpg.create_pool(dsn=self._dsn, min_size=1, max_size=20)
+        # Supabase client not required for RPC (we use httpx). Skip creating SDK client.
+        # Left here intentionally no-op to avoid version/API mismatches.
 
     async def disconnect(self) -> None:
         if self._pool is not None:
@@ -34,7 +43,8 @@ class Database:
 
     @asynccontextmanager
     async def transaction(self):
-        assert self._pool is not None, "Database not connected"
+        if self._pool is None:
+            raise RuntimeError("Database pool not configured. Set DATABASE_URL or use Supabase-only mode with limited endpoints.")
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 yield conn
@@ -250,66 +260,97 @@ class Database:
             return "Committee"
         return "Member"
 
-    async def fetch_student_bundle(self, conn: asyncpg.Connection, user_id: str) -> StudentBundle:
-        # Profiles row (main)
-        prof = await conn.fetchrow(
-            """
-            SELECT user_id, current_year, university, grades, industry_exposure,
-                   months_of_experience, awards, certifications
-            FROM student_profiles WHERE user_id = $1
-            """,
-            user_id,
-        )
+    async def fetch_student_bundle(self, conn: Optional[asyncpg.Connection], user_id: str) -> StudentBundle:
+        # Try Supabase client first if configured; fall back to direct DB; handle no-DB mode
+        prof: Optional[Dict[str, Any]] = None
+        if self._supabase is not None:
+            resp = await self._supabase.table("student_profiles").select(
+                "user_id,current_year,university,grades,industry_exposure,months_of_experience,awards,certifications"
+            ).eq("user_id", user_id).maybe_single().execute()
+            prof = resp.data if resp and resp.data else None
+        elif conn is not None:
+            row = await conn.fetchrow(
+                """
+                SELECT user_id, current_year, university, grades, industry_exposure,
+                       months_of_experience, awards, certifications
+                FROM student_profiles WHERE user_id = $1
+                """,
+                user_id,
+            )
+            prof = dict(row) if row else None
 
-        academic_year = int(prof["current_year"]) if prof and prof["current_year"] is not None else 0
-        university_tier = self._classify_university_tier(prof["university"] if prof else None)
-        grade = self._normalize_grade(prof["grades"] if prof else None)
-        total_months = int(prof["months_of_experience"]) if prof and prof["months_of_experience"] is not None else 0
-        awards = int(prof["awards"]) if prof and prof["awards"] is not None else 0
-        certs = int(prof["certifications"]) if prof and prof["certifications"] is not None else 0
-        exposure = self._normalize_exposure(prof["industry_exposure"] if prof else None)
+        academic_year = int(prof.get("current_year")) if prof and prof.get("current_year") is not None else 0
+        university_tier = self._classify_university_tier(prof.get("university") if prof else None)
+        grade = self._normalize_grade(prof.get("grades") if prof else None)
+        total_months = int(prof.get("months_of_experience")) if prof and prof.get("months_of_experience") is not None else 0
+        awards = int(prof.get("awards")) if prof and prof.get("awards") is not None else 0
+        certs = int(prof.get("certifications")) if prof and prof.get("certifications") is not None else 0
+        exposure = self._normalize_exposure(prof.get("industry_exposure") if prof else None)
 
         # GCSEs count
-        num_gcse_row = await conn.fetchrow(
-            "SELECT COUNT(*) AS c FROM student_gcses WHERE user_id = $1",
-            user_id,
-        )
-        num_gcse = int(num_gcse_row["c"]) if num_gcse_row else 0
+        if self._supabase is not None:
+            gcse_resp = await self._supabase.table("student_gcses").select("id").eq("user_id", user_id).execute()
+            num_gcse = len(gcse_resp.data or [])
+        elif conn is not None:
+            num_gcse_row = await conn.fetchrow(
+                "SELECT COUNT(*) AS c FROM student_gcses WHERE user_id = $1",
+                user_id,
+            )
+            num_gcse = int(num_gcse_row["c"]) if num_gcse_row else 0
+        else:
+            num_gcse = 0
 
         # A-levels: schema shows only subject; without grade/category, we leave empty
         # Optionally, derive categories from subject for future refinement.
         alevels: List[ALevel] = []
 
         # Internships
-        intern_rows = await conn.fetch(
-            """
-            SELECT tier, months, year
-            FROM student_internships WHERE user_id = $1
-            """,
-            user_id,
-        )
+        if self._supabase is not None:
+            i_resp = await self._supabase.table("student_internships").select("tier,months,year").eq("user_id", user_id).execute()
+            intern_rows = i_resp.data or []
+        elif conn is not None:
+            intern_rows = await conn.fetch(
+                """
+                SELECT tier, months, year
+                FROM student_internships WHERE user_id = $1
+                """,
+                user_id,
+            )
+        else:
+            intern_rows = []
         internships: List[Internship] = []
         for r in intern_rows:
             tier_norm = self._normalize_intern_tier(r["tier"]) or "Regional"
-            months = int(r["months"]) if r["months"] is not None else 0
-            year = int(r["year"]) if r["year"] is not None else datetime.utcnow().year
+            months_val = r["months"] if isinstance(r, dict) else r["months"]
+            year_val = r["year"] if isinstance(r, dict) else r["year"]
+            months = int(months_val) if months_val is not None else 0
+            year = int(year_val) if year_val is not None else datetime.utcnow().year
             internships.append(
                 Internship(tier=tier_norm, months=months, end_year=year, end_month=6)
             )
 
         # Society roles
-        role_rows = await conn.fetch(
-            """
-            SELECT role_title, society_size, years_active
-            FROM student_society_roles WHERE user_id = $1
-            """,
-            user_id,
-        )
+        if self._supabase is not None:
+            r_resp = await self._supabase.table("student_society_roles").select("role_title,society_size,years_active").eq("user_id", user_id).execute()
+            role_rows = r_resp.data or []
+        elif conn is not None:
+            role_rows = await conn.fetch(
+                """
+                SELECT role_title, society_size, years_active
+                FROM student_society_roles WHERE user_id = $1
+                """,
+                user_id,
+            )
+        else:
+            role_rows = []
         society_roles: List[SocietyRole] = []
         for r in role_rows:
-            role = self._normalize_role_title(r["role_title"]) if r["role_title"] else "Member"
-            size = self._normalize_society_size(r["society_size"]) if r["society_size"] else "Small"
-            years = int(r["years_active"]) if r["years_active"] is not None else 1
+            role_title = r["role_title"] if isinstance(r, dict) else r["role_title"]
+            society_size = r["society_size"] if isinstance(r, dict) else r["society_size"]
+            years_active = r["years_active"] if isinstance(r, dict) else r["years_active"]
+            role = self._normalize_role_title(role_title) if role_title else "Member"
+            size = self._normalize_society_size(society_size) if society_size else "Small"
+            years = int(years_active) if years_active is not None else 1
             society_roles.append(SocietyRole(role=role, size=size, years=years))
 
         return StudentBundle(
@@ -326,5 +367,34 @@ class Database:
             certifications_count=certs,
             exposure=exposure,
         )
+
+    # -----------------------------
+    # Supabase RPC helpers
+    # -----------------------------
+
+    async def call_save_compute_result_supabase(self, params: Dict[str, Any]) -> Any:
+        if not settings.supabase_url:
+            raise RuntimeError("SUPABASE_URL is not set")
+        url = settings.supabase_url.rstrip("/") + "/rest/v1/rpc/save_compute_result"
+        key = settings.supabase_service_key or settings.supabase_anon_key
+        if not key:
+            raise RuntimeError("SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY must be set")
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+        # Note: We are not attempting to upsert into 'users' via REST as table paths vary.
+        # Ensure your DB function either creates the user row or remove the FK requirement for testing.
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, headers=headers, json=params)
+            if r.status_code == 204:
+                logger.info("Supabase RPC save_compute_result: 204 No Content (success)")
+                return {"ok": True}
+            if r.status_code >= 400:
+                # Log full error body for debugging conflicts/constraints
+                logger.error("Supabase RPC error %s: %s", r.status_code, r.text)
+                r.raise_for_status()
+            return r.json()
 
 
