@@ -1,7 +1,7 @@
 ## Ranking Algo Service (Starter)
 
 ### What this is
-FastAPI service + Redis queue + Postgres, with workers, cron, scoring functions, and migrations per the spec.
+FastAPI service + Redis queue + Postgres (Supabase-managed schema), with workers, cron, and scoring functions.
 
 ### Quick start (Docker)
 1. Ensure Docker is running
@@ -19,23 +19,30 @@ uvicorn app.app:app --reload --loop auto --http auto
 
 Run worker:
 ```
-python -m app.run_worker
+ENVIRONMENT=local python -m app.run_worker
 ```
 
 Run cron:
 ```
-python -m app.run_cron
+ENVIRONMENT=local python -m app.run_cron
 ```
 
-### Migrations
-```
-alembic upgrade head
-```
+### Schema
+Managed in Supabase. Ensure required tables exist.
 
 ### Env vars
-- `DATABASE_URL` (asyncpg DSN)
+- `DATABASE_URL` (asyncpg DSN to Supabase Postgres)
 - `REDIS_URL` (redis://)
 - `WEBHOOK_HMAC_SECRET`
 - `CONFIG_VERSION`
+ - `SUPABASE_URL`
+ - `SUPABASE_ANON_KEY` or `SUPABASE_SERVICE_KEY` (prefer service key server-side)
+
+### Tests
+Install dev deps and run:
+```
+pip install -r requirements.txt
+pytest -q
+```
 
 
