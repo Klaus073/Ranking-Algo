@@ -387,14 +387,12 @@ class Database:
         # Note: We are not attempting to upsert into 'users' via REST as table paths vary.
         # Ensure your DB function either creates the user row or remove the FK requirement for testing.
         async with httpx.AsyncClient(timeout=30) as client:
+            # Send flat JSON with named parameters matching the function signature
             r = await client.post(url, headers=headers, json=params)
-            if r.status_code == 204:
-                logger.info("Supabase RPC save_compute_result: 204 No Content (success)")
-                return {"ok": True}
-            if r.status_code >= 400:
-                # Log full error body for debugging conflicts/constraints
-                logger.error("Supabase RPC error %s: %s", r.status_code, r.text)
-                r.raise_for_status()
-            return r.json()
+            if r.status_code in (200, 201, 204):
+                logger.info("Supabase RPC save_compute_result: %s (success)", r.status_code)
+                return {} if r.status_code == 204 else r.json()
+            logger.error("Supabase RPC error %s: %s", r.status_code, r.text)
+            r.raise_for_status()
 
 

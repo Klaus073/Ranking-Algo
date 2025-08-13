@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from .config import settings
 from .queue import queue
+from .cache import score_cache
 from .repo import Database
 from .schemas import EnqueueJob, RankingResponse, WebhookEvent, ScoreBreakdown, SupabaseWebhook
 from .scoring import compute_scores
@@ -38,6 +39,7 @@ async def on_startup() -> None:
             except Exception:
                 # Allow startup to proceed for read-only endpoints and webhook enqueue
                 pass
+        await score_cache.connect()
     logger.info(
         "App startup: env=%s supabase_url=%s",
         settings.environment,
@@ -51,6 +53,7 @@ async def on_shutdown() -> None:
     if settings.environment != "test":
         await queue.disconnect()
         await db.disconnect()
+        await score_cache.disconnect()
 
 
 @app.post("/webhook")
@@ -84,6 +87,67 @@ async def webhook_from_supabase(request: Request):
     if not user_id:
         logger.warning("Webhook missing user_id; ignoring")
         return JSONResponse({"ok": False, "error": "missing_user_id"}, status_code=400)
+
+    # If this is an email verification event, mark verified and flush cached scores
+    if event == "email_verified":
+        await score_cache.set_verified(user_id)
+        pushed = False
+        detail: Optional[str] = None
+        cached = await score_cache.get_scores(user_id)
+        if cached:
+            try:
+                if settings.database_url:
+                    async with db.transaction() as conn:
+                        await conn.fetchval(
+                            """
+                            SELECT public.save_compute_result(
+                              p_user_id := $1::uuid,
+                              p_academic := $2::double precision,
+                              p_experience := $3::double precision,
+                              p_composite := $4::double precision,
+                              p_stars := $5::text,
+                              p_config_version := $6::text,
+                              p_compute_run_id := $7::uuid,
+                              p_input_checksum := $8::text,
+                              p_academic_components := $9::jsonb,
+                              p_experience_components := $10::jsonb,
+                              p_effective_academic_weights := $11::jsonb
+                            )
+                            """,
+                            cached.get("p_user_id") or user_id,
+                            cached["p_academic"],
+                            cached["p_experience"],
+                            cached["p_composite"],
+                            cached.get("p_stars", ""),
+                            cached.get("p_config_version", settings.config_version),
+                            cached.get("p_compute_run_id"),
+                            cached.get("p_input_checksum"),
+                            json.dumps(cached.get("p_academic_components", {})),
+                            json.dumps(cached.get("p_experience_components", {})),
+                            json.dumps(cached.get("p_effective_academic_weights", {})),
+                        )
+                else:
+                    allowed = {
+                        "p_user_id",
+                        "p_academic",
+                        "p_experience",
+                        "p_composite",
+                        "p_stars",
+                        "p_config_version",
+                        "p_compute_run_id",
+                        "p_input_checksum",
+                        "p_academic_components",
+                        "p_experience_components",
+                        "p_effective_academic_weights",
+                    }
+                    payload = {k: v for k, v in cached.items() if k in allowed}
+                    await db.call_save_compute_result_supabase(payload)
+                pushed = True
+            except Exception as exc:
+                logger.exception("Verification flush failed for user_id=%s: %s", user_id, exc)
+            finally:
+                await score_cache.clear_scores(user_id)
+        return JSONResponse({"ok": True, "pushed": pushed, "detail": detail})
 
     reason = "user_created" if event == "user_registered" else "student_updated"
     # Merge input/profile and include top-level email if present so worker can upsert user row
@@ -134,6 +198,61 @@ async def webhook_student_updated(request: Request):
     )
     await queue.enqueue(job.dict())
     return JSONResponse({"status": "ok"})
+
+
+@app.post("/api/verify/{user_id}")
+async def verification_hook(user_id: str):
+    # Mark user verified, then attempt to flush cached scores to DB
+    await score_cache.set_verified(user_id)
+    pushed = False
+    detail: Optional[str] = None
+    # Try to read cached scores and persist
+    cached = await score_cache.get_scores(user_id)
+    if cached:
+        try:
+            async with db.transaction() as conn:
+                # Support both CE RPC payload and legacy bundle path
+                if "p_composite" in cached:
+                    # CE path: call stored procedure if DB URL set, otherwise Supabase RPC
+                    if settings.database_url:
+                        await conn.fetchval(
+                            """
+                            SELECT public.save_compute_result(
+                              p_user_id := $1::uuid,
+                              p_academic := $2::double precision,
+                              p_experience := $3::double precision,
+                              p_composite := $4::double precision,
+                              p_stars := $5::text,
+                              p_config_version := $6::text,
+                              p_compute_run_id := $7::uuid,
+                              p_input_checksum := $8::text,
+                              p_academic_components := $9::jsonb,
+                              p_experience_components := $10::jsonb,
+                              p_effective_academic_weights := $11::jsonb
+                            )
+                            """,
+                            cached.get("p_user_id") or user_id,
+                            cached["p_academic"],
+                            cached["p_experience"],
+                            cached["p_composite"],
+                            cached.get("p_stars", ""),
+                            cached.get("p_config_version", settings.config_version),
+                            cached.get("p_compute_run_id"),
+                            cached.get("p_input_checksum"),
+                            json.dumps(cached.get("p_academic_components", {})),
+                            json.dumps(cached.get("p_experience_components", {})),
+                            json.dumps(cached.get("p_effective_academic_weights", {})),
+                        )
+                    else:
+                        await db.call_save_compute_result_supabase(cached)
+                    pushed = True
+                else:
+                    # Legacy path not expected in cache; ignore
+                    detail = "cached payload missing CE fields"
+        finally:
+            # Clear cache regardless; we rely on idempotency in DB function
+            await score_cache.clear_scores(user_id)
+    return {"ok": True, "pushed": pushed, "detail": detail}
 
 
 @app.get("/api/ranking/{user_id}", response_model=RankingResponse)

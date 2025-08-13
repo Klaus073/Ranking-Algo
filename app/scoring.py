@@ -102,7 +102,12 @@ def _map_gcse_category(num_gcse: int) -> str:
 
 
 def _map_degree_grade_band(grade: str | None, year: int) -> str:
+    # Provide sensible defaults to avoid NaN in CE lookups
     if not grade:
+        if year == 2:
+            return "60-69"
+        if year >= 3:
+            return "66-69"
         return "N/A"
     g = grade
     if year == 2:

@@ -21,6 +21,8 @@ class AppSettings(BaseModel):
     # Queue / Redis (default to local on Windows/dev)
     redis_url: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
     debounce_ttl_seconds: int = int(os.getenv("DEBOUNCE_TTL_SECONDS", "2"))
+    # Cache
+    score_cache_ttl_seconds: int = int(os.getenv("SCORE_CACHE_TTL_SECONDS", "86400"))
 
     # Database (Postgres)
     # Note: asyncpg expects plain 'postgresql://' or 'postgres://'. Leave empty to disable direct DB.
