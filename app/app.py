@@ -168,15 +168,31 @@ async def webhook_from_supabase(request: Request):
     )
     logger.info("Enqueue job: id=%s user_id=%s reason=%s", job.job_id, job.user_id, job.reason)
 
-    # Try to enqueue; in dev, return 200 even if queue is down so you can iterate
-    try:
-        await queue.enqueue(job.dict())
-        queued = True
-    except Exception as exc:
-        queued = False
-        logger.exception("Enqueue failed: %s", exc)
+    # Debounce frequent updates for student profile changes
+    debounced = False
+    should_enqueue = True
+    if reason == "student_updated":
+        try:
+            # Only enqueue if no recent event was processed within TTL
+            allowed = await queue.set_debounce(user_id, settings.debounce_ttl_seconds)
+            if not allowed:
+                debounced = True
+                should_enqueue = False
+        except Exception:
+            # Fail-open on debounce so we don't drop events if Redis is down
+            logger.exception("Debounce check failed; proceeding to enqueue")
 
-    return JSONResponse({"ok": True, "queued": queued})
+    # Try to enqueue; in dev, return 200 even if queue is down so you can iterate
+    queued = False
+    if should_enqueue:
+        try:
+            await queue.enqueue(job.dict())
+            queued = True
+        except Exception as exc:
+            queued = False
+            logger.exception("Enqueue failed: %s", exc)
+
+    return JSONResponse({"ok": True, "queued": queued, "debounced": debounced})
 
 
 @app.post("/api/webhook/student-updated")
@@ -196,8 +212,21 @@ async def webhook_student_updated(request: Request):
         config_version=settings.config_version,
         attempt=1,
     )
-    await queue.enqueue(job.dict())
-    return JSONResponse({"status": "ok"})
+    # Debounce: skip enqueue if a recent event exists
+    debounced = False
+    try:
+        allowed = await queue.set_debounce(event.user_id, settings.debounce_ttl_seconds)
+        if allowed:
+            await queue.enqueue(job.dict())
+            queued = True
+        else:
+            debounced = True
+            queued = False
+    except Exception:
+        # Fail-open: try enqueue even if debounce check failed
+        await queue.enqueue(job.dict())
+        queued = True
+    return JSONResponse({"status": "ok", "queued": queued, "debounced": debounced})
 
 
 @app.post("/api/verify/{user_id}")
