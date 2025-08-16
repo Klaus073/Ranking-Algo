@@ -181,6 +181,16 @@ async def webhook_from_supabase(request: Request):
         except Exception:
             # Fail-open on debounce so we don't drop events if Redis is down
             logger.exception("Debounce check failed; proceeding to enqueue")
+    elif reason == "user_created":
+        try:
+            # Separate 5s debounce just for registration bursts
+            key = f"registration:{user_id}"
+            allowed = await queue.set_named_debounce(key, settings.registration_debounce_ttl_seconds)
+            if not allowed:
+                debounced = True
+                should_enqueue = False
+        except Exception:
+            logger.exception("Registration debounce check failed; proceeding to enqueue")
 
     # Try to enqueue; in dev, return 200 even if queue is down so you can iterate
     queued = False
@@ -238,6 +248,14 @@ async def verification_hook(user_id: str):
     # Try to read cached scores and persist
     cached = await score_cache.get_scores(user_id)
     if cached:
+        # Registration-specific debounce: avoid double push right after signup
+        try:
+            allowed = await queue.set_named_debounce(f"registration-flush:{user_id}", settings.registration_debounce_ttl_seconds)
+            if not allowed:
+                return {"ok": True, "pushed": False, "detail": "debounced"}
+        except Exception:
+            # Continue on failure
+            pass
         try:
             async with db.transaction() as conn:
                 # Support both CE RPC payload and legacy bundle path

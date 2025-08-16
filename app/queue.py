@@ -47,6 +47,12 @@ class RedisQueue:
         was_set = await self._redis.set(key, "1", ex=ttl_seconds, nx=True)
         return bool(was_set)
 
+    async def set_named_debounce(self, name: str, ttl_seconds: int) -> bool:
+        assert self._redis is not None
+        key = f"debounce:{name}"
+        was_set = await self._redis.set(key, "1", ex=ttl_seconds, nx=True)
+        return bool(was_set)
+
     async def acquire_lock(self, name: str, ttl_seconds: int = 60) -> bool:
         assert self._redis is not None
         key = f"lock:{name}"

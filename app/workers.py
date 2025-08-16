@@ -9,6 +9,7 @@ import logging
 
 from .config import settings
 from .queue import queue
+from .cache import score_cache
 from .repo import Database
 from .schemas import EnqueueJob, StudentBundle
 from .scoring import compute_scores, _load_ce_scorer  # type: ignore
@@ -192,21 +193,34 @@ async def handle_job(job: EnqueueJob) -> None:
                     "p_experience_components": components_ex,
                     "p_effective_academic_weights": eff_w,
                 }
+                # Gate writes on verification; cache otherwise
                 try:
-                    await db.call_save_compute_result_supabase(params)
-                    logger.info(
-                        "Saved CE scores via Supabase RPC: user_id=%s composite=%.2f academic=%.2f experience=%.2f stars=%s",
-                        job.user_id, composite, academic, experience, stars,
-                    )
-                    logger.info(
-                        "DB payload preview: checksum=%s ac=%s ex=%s eff_w=%s",
-                        checksum,
-                        json.dumps(components_ac, separators=(",", ":")),
-                        json.dumps(components_ex, separators=(",", ":")),
-                        json.dumps(eff_w, separators=(",", ":")),
-                    )
+                    if await score_cache.is_verified(job.user_id):
+                        await db.call_save_compute_result_supabase(params)
+                        logger.info(
+                            "Saved CE scores via Supabase RPC: user_id=%s composite=%.2f academic=%.2f experience=%.2f stars=%s",
+                            job.user_id, composite, academic, experience, stars,
+                        )
+                        logger.info(
+                            "DB payload preview: checksum=%s ac=%s ex=%s eff_w=%s",
+                            checksum,
+                            json.dumps(components_ac, separators=(",", ":")),
+                            json.dumps(components_ex, separators=(",", ":")),
+                            json.dumps(eff_w, separators=(",", ":")),
+                        )
+                    else:
+                        await score_cache.set_scores(job.user_id, params)
+                        logger.info(
+                            "Cached CE scores pending verification: user_id=%s reason=%s composite=%.2f academic=%.2f experience=%.2f stars=%s",
+                            job.user_id,
+                            job.reason,
+                            composite,
+                            academic,
+                            experience,
+                            stars,
+                        )
                 except Exception:
-                    logger.exception("Supabase RPC save_compute_result failed for user_id=%s", job.user_id)
+                    logger.exception("Persist/cache failed for user_id=%s", job.user_id)
             else:
                 logger.info(
                     "Computed CE scores (no DB write): user_id=%s composite=%.2f academic=%.2f experience=%.2f index=%.2f stars=%s",
@@ -386,6 +400,38 @@ async def handle_job(job: EnqueueJob) -> None:
             compute_run_id = str(uuid.uuid4())
             checksum = "sha256:" + hashlib.sha256(canonical_json(p).encode("utf-8")).hexdigest()
 
+            # Build common params for cache/verify flush or immediate persist
+            params = {
+                "p_user_id": job.user_id,
+                "p_academic": academic,
+                "p_experience": experience,
+                "p_composite": composite,
+                "p_stars": stars,
+                "p_config_version": settings.config_version,
+                "p_compute_run_id": compute_run_id,
+                "p_input_checksum": checksum,
+                "p_academic_components": components_ac,
+                "p_experience_components": components_ex,
+                "p_effective_academic_weights": eff_w,
+            }
+
+            # Gate on verification: cache if not verified, otherwise persist now
+            try:
+                if not await score_cache.is_verified(job.user_id):
+                    await score_cache.set_scores(job.user_id, params)
+                    logger.info(
+                        "Cached CE scores pending verification (DB mode): user_id=%s reason=%s composite=%.2f academic=%.2f experience=%.2f stars=%s",
+                        job.user_id,
+                        job.reason,
+                        composite,
+                        academic,
+                        experience,
+                        stars,
+                    )
+                    return
+            except Exception:
+                logger.exception("Verification/cache check failed; proceeding to persist for user_id=%s", job.user_id)
+
             # Call stored procedure; it writes to all relevant tables internally
             if settings.database_url:
                 await conn.fetchval(
@@ -404,33 +450,20 @@ async def handle_job(job: EnqueueJob) -> None:
                       p_effective_academic_weights := $11::jsonb
                     )
                     """,
-                    job.user_id,
-                    academic,
-                    experience,
-                    composite,
-                    stars,
-                    settings.config_version,
-                    compute_run_id,
-                    checksum,
-                    json.dumps(components_ac),
-                    json.dumps(components_ex),
-                    json.dumps(eff_w),
+                    params["p_user_id"],
+                    params["p_academic"],
+                    params["p_experience"],
+                    params["p_composite"],
+                    params["p_stars"],
+                    params["p_config_version"],
+                    params["p_compute_run_id"],
+                    params["p_input_checksum"],
+                    json.dumps(params["p_academic_components"]),
+                    json.dumps(params["p_experience_components"]),
+                    json.dumps(params["p_effective_academic_weights"]),
                 )
             else:
                 # Supabase RPC path
-                params = {
-                    "p_user_id": job.user_id,
-                    "p_academic": academic,
-                    "p_experience": experience,
-                    "p_composite": composite,
-                    "p_stars": stars,
-                    "p_config_version": settings.config_version,
-                    "p_compute_run_id": compute_run_id,
-                    "p_input_checksum": checksum,
-                    "p_academic_components": components_ac,
-                    "p_experience_components": components_ex,
-                    "p_effective_academic_weights": eff_w,
-                }
                 try:
                     await db.call_save_compute_result_supabase(params)
                 except Exception:
@@ -512,6 +545,7 @@ async def handle_job(job: EnqueueJob) -> None:
 
 async def worker_loop() -> None:
     await queue.connect()
+    await score_cache.connect()
     await db.connect()
     supa_cfg = bool(settings.supabase_url and (settings.supabase_service_key or settings.supabase_anon_key))
     logger.info("Worker started. Redis URL=%s SupabaseConfigured=%s DB=%s", settings.redis_url, supa_cfg, bool(settings.database_url))
