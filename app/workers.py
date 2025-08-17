@@ -31,14 +31,15 @@ def compute_checksum(bundle: StudentBundle) -> str:
 
 
 async def handle_job(job: EnqueueJob) -> None:
-    # Debounce per user to coalesce bursts
-    if not await queue.set_debounce(job.user_id, settings.debounce_ttl_seconds):
-        return
-
+    # Note: Debouncing is already handled in app.py when enqueueing jobs
+    # No need to debounce again here as it causes double-debouncing issues
+    
     await db.connect()
 
     # Supabase-only mode (no DATABASE_URL): fetch via Supabase client and compute, log results, skip writes
     if not settings.database_url:
+        logger.info("Processing in Supabase-only mode: user_id=%s reason=%s profile_present=%s", 
+                   job.user_id, job.reason, bool(job.profile))
         # If profile present, use CE mapping directly for highest fidelity with new algo
         if job.profile:
             p = job.profile or {}
@@ -108,6 +109,17 @@ async def handle_job(job: EnqueueJob) -> None:
             academic = float(rec["Academic"]) 
             experience = float(rec["Experience"]) 
             stars = str(rec["Stars"]) 
+
+            # Log computed scores immediately after calculation
+            logger.info(
+                "Computed scores for student_updated event: user_id=%s reason=%s composite=%.2f academic=%.2f experience=%.2f stars=%s",
+                job.user_id,
+                job.reason,
+                composite,
+                academic,
+                experience,
+                stars,
+            )
 
             # If Supabase env is configured, write via Supabase RPC even in no-DB mode
             if settings.supabase_url and (settings.supabase_service_key or settings.supabase_anon_key):
@@ -219,6 +231,13 @@ async def handle_job(job: EnqueueJob) -> None:
                             experience,
                             stars,
                         )
+                        logger.info(
+                            "DB payload preview: checksum=%s ac=%s ex=%s eff_w=%s",
+                            checksum,
+                            json.dumps(components_ac, separators=(",", ":")),
+                            json.dumps(components_ex, separators=(",", ":")),
+                            json.dumps(eff_w, separators=(",", ":")),
+                        )
                 except Exception:
                     logger.exception("Persist/cache failed for user_id=%s", job.user_id)
             else:
@@ -233,6 +252,7 @@ async def handle_job(job: EnqueueJob) -> None:
                 )
             return
         # Else, fall back to fetching bundle
+        logger.info("No profile in job, fetching bundle from Supabase: user_id=%s", job.user_id)
         try:
             bundle = await db.fetch_student_bundle(None, job.user_id)  # type: ignore[arg-type]
         except Exception:
@@ -322,6 +342,17 @@ async def handle_job(job: EnqueueJob) -> None:
             academic = float(rec["Academic"])   # CE points
             experience = float(rec["Experience"])  # CE points
             stars = str(rec["Stars"])  # band string
+
+            # Log computed scores immediately after calculation
+            logger.info(
+                "Computed scores for student_updated event: user_id=%s reason=%s composite=%.2f academic=%.2f experience=%.2f stars=%s",
+                job.user_id,
+                job.reason,
+                composite,
+                academic,
+                experience,
+                stars,
+            )
 
             # Build components JSON (approx contributions) and effective weights
             L = CFG["lookups"]
@@ -428,6 +459,13 @@ async def handle_job(job: EnqueueJob) -> None:
                         experience,
                         stars,
                     )
+                    logger.info(
+                        "DB payload preview: checksum=%s ac=%s ex=%s eff_w=%s",
+                        checksum,
+                        json.dumps(components_ac, separators=(",", ":")),
+                        json.dumps(components_ex, separators=(",", ":")),
+                        json.dumps(eff_w, separators=(",", ":")),
+                    )
                     return
             except Exception:
                 logger.exception("Verification/cache check failed; proceeding to persist for user_id=%s", job.user_id)
@@ -484,6 +522,19 @@ async def handle_job(job: EnqueueJob) -> None:
                 json.dumps(components_ex, separators=(",", ":")),
                 json.dumps(eff_w, separators=(",", ":")),
             )
+            # Best-effort: log current rank after persist (may be None until cron recomputes ranks)
+            try:
+                row = await db.get_ranking_row(conn, job.user_id)
+                rank_val = row["rank"] if row else None
+                percentile_val = row["percentile"] if row else None
+                logger.info(
+                    "Current rank (may await cron): user_id=%s rank=%s percentile=%s",
+                    job.user_id,
+                    rank_val,
+                    percentile_val,
+                )
+            except Exception:
+                logger.exception("Failed to fetch rank after save for user_id=%s", job.user_id)
             return
 
         # Legacy fallback: fetch bundle and use legacy compute/write
@@ -505,6 +556,15 @@ async def handle_job(job: EnqueueJob) -> None:
         logger.info(
             "Computed scores: user_id=%s composite=%.3f academic=%.3f experience=%.3f",
             job.user_id,
+            composite,
+            academic,
+            experience,
+        )
+        # Log computed scores immediately after calculation for legacy path
+        logger.info(
+            "Computed scores for student_updated event: user_id=%s reason=%s composite=%.3f academic=%.3f experience=%.3f",
+            job.user_id,
+            job.reason,
             composite,
             academic,
             experience,
@@ -541,6 +601,20 @@ async def handle_job(job: EnqueueJob) -> None:
             config_version=settings.config_version,
             compute_run_id=compute_run_id,
         )
+
+        # Best-effort: log current rank after upsert (may be None until cron recomputes ranks)
+        try:
+            row = await db.get_ranking_row(conn, job.user_id)
+            rank_val = row["rank"] if row else None
+            percentile_val = row["percentile"] if row else None
+            logger.info(
+                "Current rank (may await cron): user_id=%s rank=%s percentile=%s",
+                job.user_id,
+                rank_val,
+                percentile_val,
+            )
+        except Exception:
+            logger.exception("Failed to fetch rank after upsert for user_id=%s", job.user_id)
 
 
 async def worker_loop() -> None:
