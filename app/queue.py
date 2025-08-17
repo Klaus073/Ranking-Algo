@@ -62,6 +62,16 @@ class RedisQueue:
         assert self._redis is not None
         await self._redis.delete(f"lock:{name}")
 
+    async def clear_debounce(self, user_id: str) -> None:
+        """Clear debounce key for a user (useful for testing)"""
+        assert self._redis is not None
+        await self._redis.delete(f"debounce:{user_id}")
+
+    async def clear_named_debounce(self, name: str) -> None:
+        """Clear named debounce key (useful for testing)"""
+        assert self._redis is not None
+        await self._redis.delete(f"debounce:{name}")
+
 
 queue = RedisQueue(settings.redis_url)
 
