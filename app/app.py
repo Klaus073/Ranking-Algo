@@ -88,8 +88,16 @@ async def webhook_from_supabase(request: Request):
         logger.warning("Webhook missing user_id; ignoring")
         return JSONResponse({"ok": False, "error": "missing_user_id"}, status_code=400)
 
-    # If this is an email verification event, mark verified and flush cached scores
+    # If this is an email verification event, reset debounce and flush cached scores
     if event == "email_verified":
+        # Reset debounce window immediately: clear permanent registration debounce and set 45s window
+        try:
+            await queue.clear_debounce(user_id)
+            await queue.set_debounce(user_id, settings.debounce_ttl_seconds)
+            logger.info("Immediately cleared permanent debounce and set 45s debounce (webhook): user_id=%s", user_id)
+        except Exception:
+            logger.exception("Failed to reset debounce (webhook) for user_id=%s", user_id)
+
         await score_cache.set_verified(user_id)
         pushed = False
         detail: Optional[str] = None
@@ -168,29 +176,31 @@ async def webhook_from_supabase(request: Request):
     )
     logger.info("Enqueue job: id=%s user_id=%s reason=%s", job.job_id, job.user_id, job.reason)
 
-    # Debounce frequent updates for student profile changes
+    # Debounce logic: debounce student_updated events after user registration OR verification
     debounced = False
     should_enqueue = True
+    
     if reason == "student_updated":
+        # Debounce student_updated events (after registration OR verification)
         try:
-            # Only enqueue if no recent event was processed within TTL
             allowed = await queue.set_debounce(user_id, settings.debounce_ttl_seconds)
             if not allowed:
                 debounced = True
                 should_enqueue = False
+                logger.info("Student update debounced: user_id=%s (within %d seconds of registration/verification)", 
+                           user_id, settings.debounce_ttl_seconds)
         except Exception:
             # Fail-open on debounce so we don't drop events if Redis is down
             logger.exception("Debounce check failed; proceeding to enqueue")
     elif reason == "user_created":
+        # Set permanent debounce after user registration (until verification)
         try:
-            # Separate 5s debounce just for registration bursts
-            key = f"registration:{user_id}"
-            allowed = await queue.set_named_debounce(key, settings.registration_debounce_ttl_seconds)
-            if not allowed:
-                debounced = True
-                should_enqueue = False
+            # Use a very long TTL to effectively block until verification
+            await queue.set_debounce(user_id, 86400)  # 24 hours
+            logger.info("Set permanent debounce after registration: user_id=%s (until verification)", 
+                       user_id)
         except Exception:
-            logger.exception("Registration debounce check failed; proceeding to enqueue")
+            logger.exception("Failed to set debounce after registration for user_id=%s", user_id)
 
     # Try to enqueue; in dev, return 200 even if queue is down so you can iterate
     queued = False
@@ -203,6 +213,19 @@ async def webhook_from_supabase(request: Request):
             logger.exception("Enqueue failed: %s", exc)
 
     return JSONResponse({"ok": True, "queued": queued, "debounced": debounced})
+
+
+@app.post("/api/debug/clear-debounce/{user_id}")
+async def clear_debounce(user_id: str):
+    """Debug endpoint to clear debounce for a user (development only)"""
+    try:
+        await queue.clear_debounce(user_id)
+        # Also clear legacy named debounce keys for backward compatibility
+        await queue.clear_named_debounce(f"registration:{user_id}")
+        await queue.clear_named_debounce(f"registration-flush:{user_id}")
+        return JSONResponse({"ok": True, "message": f"Cleared debounce for user {user_id}"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
 
 
 @app.post("/api/webhook/student-updated")
@@ -241,6 +264,14 @@ async def webhook_student_updated(request: Request):
 
 @app.post("/api/verify/{user_id}")
 async def verification_hook(user_id: str):
+    # Immediately clear permanent debounce and set 45-second debounce
+    try:
+        await queue.clear_debounce(user_id)
+        await queue.set_debounce(user_id, settings.debounce_ttl_seconds)
+        logger.info("Immediately cleared permanent debounce and set 45s debounce: user_id=%s", user_id)
+    except Exception:
+        logger.exception("Failed to reset debounce for user_id=%s", user_id)
+    
     # Mark user verified, then attempt to flush cached scores to DB
     await score_cache.set_verified(user_id)
     pushed = False
@@ -248,14 +279,7 @@ async def verification_hook(user_id: str):
     # Try to read cached scores and persist
     cached = await score_cache.get_scores(user_id)
     if cached:
-        # Registration-specific debounce: avoid double push right after signup
-        try:
-            allowed = await queue.set_named_debounce(f"registration-flush:{user_id}", settings.registration_debounce_ttl_seconds)
-            if not allowed:
-                return {"ok": True, "pushed": False, "detail": "debounced"}
-        except Exception:
-            # Continue on failure
-            pass
+        # Don't debounce here - we want to process the verification
         try:
             async with db.transaction() as conn:
                 # Support both CE RPC payload and legacy bundle path
@@ -293,6 +317,9 @@ async def verification_hook(user_id: str):
                     else:
                         await db.call_save_compute_result_supabase(cached)
                     pushed = True
+                    
+                    # Debounce already set at the beginning of verification
+                        
                 else:
                     # Legacy path not expected in cache; ignore
                     detail = "cached payload missing CE fields"
